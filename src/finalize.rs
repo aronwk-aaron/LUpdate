@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::{self, File},
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
@@ -6,20 +7,18 @@ use std::{
 
 use argh::FromArgs;
 use assembly_pack::{
+    crc::calculate_crc,
     md5::{self, MD5Sum},
+    pki::parser::parse_pki_file,
     sd0::fs::Converter,
 };
 use color_eyre::eyre::Context;
-use globset::{Glob, GlobSet, GlobSetBuilder};
 
 use crate::ProjectArgs;
 
 const CRLF: &str = "\r\n";
 
-/// Default frontend file patterns.
-/// The working cache includes all trunk entries with a file extension.
-/// `**/*.*` matches any file containing a `.` at any directory depth.
-const DEFAULT_FRONTEND_PATTERNS: &[&str] = &["**/*.*"];
+const DEFAULT_FRONTEND_PACK_PATTERN: &str = "front";
 
 const EXCLUDE_PATTERNS: &[&str] = &[
     ".git",
@@ -44,9 +43,9 @@ pub struct Args {
     #[argh(option, default = "PathBuf::from(\"patcher\")")]
     patcher: PathBuf,
 
-    /// path to file with frontend glob patterns (one per line)
-    #[argh(option)]
-    frontend_patterns: Option<PathBuf>,
+    /// substring to match pack archive names for frontend (default: "front")
+    #[argh(option, default = "DEFAULT_FRONTEND_PACK_PATTERN.to_string()")]
+    frontend_pack_pattern: String,
 
     /// compression level 0-9 (default: 1, fastest; 9 = smallest but slowest)
     #[argh(option, short = 'c', default = "1")]
@@ -148,32 +147,65 @@ fn filter_trunk(
     Ok(())
 }
 
-/// Generate frontend.txt by filtering trunk entries against frontend patterns
+/// Generate frontend.txt by including only trunk entries whose files belong to
+/// pack archives matching the given pattern (e.g. "front" matches front1.pk,
+/// ui1_front_1.pk, physics_front.pk, etc.)
 fn generate_frontend(
     cache_dir: &Path,
     manifest_name: &str,
+    pki_name: &str,
     version_num: u32,
     version_name: &str,
-    patterns: &GlobSet,
+    pack_pattern: &str,
 ) -> color_eyre::Result<()> {
+    let pki_path = cache_dir.join(pki_name);
     let trunk_path = cache_dir.join(manifest_name).with_extension("txt");
     let frontend_path = cache_dir.join("frontend.txt");
 
-    log::info!("Generating {}", frontend_path.display());
+    log::info!("Generating {} (packs matching '{}')", frontend_path.display(), pack_pattern);
+
+    let pki_data = fs::read(&pki_path)
+        .wrap_err_with(|| format!("Failed to read PKI {}", pki_path.display()))?;
+    let (_, pki) = parse_pki_file(&pki_data)
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to parse PKI: {}", e))?;
+
+    let front_indices: HashSet<u32> = pki
+        .archives
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.path.to_lowercase().contains(pack_pattern))
+        .map(|(i, _)| i as u32)
+        .collect();
+
+    log::info!(
+        "Found {} frontend pack archives out of {}",
+        front_indices.len(),
+        pki.archives.len()
+    );
+
+    let front_crcs: HashSet<u32> = pki
+        .files
+        .iter()
+        .filter(|(_, file_ref)| front_indices.contains(&file_ref.pack_file))
+        .map(|(crc, _)| crc.to_raw())
+        .collect();
+
+    log::info!("Frontend packs contain {} files", front_crcs.len());
 
     let entries = read_manifest_entries(&trunk_path)?;
     let mut frontend_lines = Vec::new();
 
-    for entry in entries {
-        // Extract file path (first field before comma)
+    for entry in &entries {
         if let Some(path) = entry.split(',').next() {
-            if patterns.is_match(path) {
-                frontend_lines.push(entry);
+            let path_backslash = path.replace('/', "\\");
+            let crc = calculate_crc(path_backslash.as_bytes()).to_raw();
+            if front_crcs.contains(&crc) {
+                frontend_lines.push(entry.clone());
             }
         }
     }
 
-    log::info!("Frontend: {} entries", frontend_lines.len());
+    log::info!("Frontend: {} of {} trunk entries", frontend_lines.len(), entries.len());
     write_manifest_crlf(&frontend_path, version_num, version_name, &frontend_lines)?;
 
     Ok(())
@@ -232,29 +264,6 @@ fn make_version(
     Ok(())
 }
 
-fn build_frontend_patterns(patterns_file: Option<&Path>) -> color_eyre::Result<GlobSet> {
-    let mut builder = GlobSetBuilder::new();
-
-    if let Some(path) = patterns_file {
-        let file = File::open(path)
-            .wrap_err_with(|| format!("Failed to open patterns file {}", path.display()))?;
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            let line = line?;
-            let trimmed = line.trim();
-            if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                builder.add(Glob::new(trimmed)?);
-            }
-        }
-    } else {
-        for pattern in DEFAULT_FRONTEND_PATTERNS {
-            builder.add(Glob::new(pattern)?);
-        }
-    }
-
-    Ok(builder.build()?)
-}
-
 pub fn run(args: ProjectArgs<Args>) -> color_eyre::Result<()> {
     let paths = args.paths();
     let cache_dir = &paths.cache_dir;
@@ -269,13 +278,19 @@ pub fn run(args: ProjectArgs<Args>) -> color_eyre::Result<()> {
     );
 
     let compression_level = args.cmd.compression;
-    let frontend_patterns = build_frontend_patterns(args.cmd.frontend_patterns.as_deref())?;
 
     log::info!("[Finalize] Filtering trunk");
     filter_trunk(cache_dir, manifest_name, vnum, &vname)?;
 
     log::info!("[Finalize] Generating frontend");
-    generate_frontend(cache_dir, manifest_name, vnum, &vname, &frontend_patterns)?;
+    generate_frontend(
+        cache_dir,
+        manifest_name,
+        &pki_name,
+        vnum,
+        &vname,
+        &args.cmd.frontend_pack_pattern,
+    )?;
 
     log::info!("[Finalize] Copying patcher.ini");
     copy_patcher(&args.cmd.patcher, cache_dir)?;
