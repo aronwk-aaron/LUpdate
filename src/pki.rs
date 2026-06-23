@@ -83,17 +83,14 @@ fn detect_locale(path: &str) -> Option<String> {
     let lower = path.to_lowercase();
     let idx = lower.find("_loc\\")?;
     let after = &lower[idx + 5..];
-    if after.len() < 5 {
-        return None;
-    }
-    let locale = &after[..5];
-    let chars: Vec<char> = locale.chars().collect();
-    if chars[0].is_alphanumeric()
-        && chars[1].is_alphanumeric()
-        && chars[2] == '_'
-        && chars[3].is_alphanumeric()
-        && chars[4].is_alphanumeric()
-    {
+    let mut chars = after.chars();
+    let c0 = chars.next().filter(|c| c.is_ascii_alphanumeric())?;
+    let c1 = chars.next().filter(|c| c.is_ascii_alphanumeric())?;
+    let c2 = chars.next().filter(|&c| c == '_')?;
+    let c3 = chars.next().filter(|c| c.is_ascii_alphanumeric())?;
+    let c4 = chars.next().filter(|c| c.is_ascii_alphanumeric())?;
+    let locale: String = [c0, c1, c2, c3, c4].iter().collect();
+    if !locale.is_empty() {
         Some(format!("_loc\\{}", locale))
     } else {
         None

@@ -271,8 +271,8 @@ impl Visitor {
         }
     }
 
-    /// Process all queued files in parallel, then merge results into the manifest.
-    fn flush_pending(&mut self, compression_level: u32) {
+    /// Compress all queued files in parallel, then merge results into the manifest.
+    fn compress_pending(&mut self, compression_level: u32) {
         if self.pending.is_empty() {
             return;
         }
@@ -469,7 +469,7 @@ pub fn run(args: ProjectArgs<Args>) -> color_eyre::Result<()> {
     }
 
     // Process all queued compressions in parallel
-    visitor.flush_pending(compression_level);
+    visitor.compress_pending(compression_level);
 
     manifest::write_manifest(visitor.manifest, &manifest).context("Failed to write manifest")?;
 
