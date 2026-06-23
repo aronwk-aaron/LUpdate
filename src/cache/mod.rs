@@ -6,7 +6,7 @@ use assembly_pack::{
     },
     crc::{calculate_crc, CRC},
     md5::{self, MD5Sum},
-    sd0::fs::{Compression, Converter},
+    sd0::fs::Converter,
     txt::{FileLine, FileMeta, Manifest, VersionLine},
 };
 use color_eyre::eyre::Context;
@@ -299,7 +299,7 @@ impl Visitor {
 
                 let conv = Converter {
                     generate_segment_index: false,
-                    compression: Some(Compression::new(compression_level)),
+                    compression: Some(compression_level),
                 };
                 let pair = conv
                     .convert_file(&p.input, &p.outpath)

@@ -7,7 +7,7 @@ use std::{
 use argh::FromArgs;
 use assembly_pack::{
     md5::{self, MD5Sum},
-    sd0::fs::{Compression, Converter},
+    sd0::fs::Converter,
 };
 use color_eyre::eyre::Context;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -215,7 +215,7 @@ fn make_version(
         log::info!("Compressing {}", file_path.display());
         let conv = Converter {
             generate_segment_index: false,
-            compression: Some(Compression::new(compression_level)),
+            compression: Some(compression_level),
         };
         let pair = conv
             .convert_file(&file_path, &compressed_path)
