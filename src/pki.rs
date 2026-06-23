@@ -7,6 +7,7 @@ use color_eyre::eyre::Context;
 use indexmap::IndexMap;
 use serde::Deserialize;
 use std::{
+    collections::BTreeMap,
     ffi::OsStr,
     fs::File,
     io::{BufRead, BufReader, BufWriter},
@@ -51,42 +52,108 @@ fn hidden_glob(filename: &str) -> Option<DirSpec> {
     None
 }
 
+/// Parse a dir spec string in the format `directory[=recursive[=filter]]`.
+///
+/// Examples:
+/// - `mesh\\env` → directory=mesh\env, recursive=true, no filter
+/// - `mesh\\env=0=re_*` → directory=mesh\env, recursive=false, filter=re_*
+/// - `brickmodels\\pettaming=1` → directory=brickmodels\pettaming, recursive=true
+fn parse_dir_spec(spec: &str) -> DirSpec {
+    let parts: Vec<&str> = spec.splitn(3, '=').collect();
+    let directory = parts[0].to_lowercase();
+    let recurse = match parts.get(1) {
+        Some(r) => *r != "0",
+        None => true,
+    };
+    let filter = parts
+        .get(2)
+        .map(|f| f.to_lowercase())
+        .unwrap_or_default();
+
+    DirSpec {
+        directory,
+        recurse_subdirectories: recurse,
+        filter_wildcard: filter,
+    }
+}
+
+/// Detect a locale directory pattern in a path (e.g. `_loc\en_gb`, `_loc\de_de`).
+/// Returns the locale segment like `_loc\de_de` if found.
+fn detect_locale(path: &str) -> Option<String> {
+    let lower = path.to_lowercase();
+    let idx = lower.find("_loc\\")?;
+    let after = &lower[idx + 5..];
+    if after.len() < 5 {
+        return None;
+    }
+    let locale = &after[..5];
+    let chars: Vec<char> = locale.chars().collect();
+    if chars[0].is_alphanumeric()
+        && chars[1].is_alphanumeric()
+        && chars[2] == '_'
+        && chars[3].is_alphanumeric()
+        && chars[4].is_alphanumeric()
+    {
+        Some(format!("_loc\\{}", locale))
+    } else {
+        None
+    }
+}
+
+/// Remap a pack name to include a locale segment after the first component.
+/// `pack\front2_3.pk` + `_loc\de_de` → `pack\_loc\de_de\front2_3.pk`
+fn localize_pack_name(pack_name: &str, locale: &str) -> String {
+    if let Some(idx) = pack_name.find('\\') {
+        format!("{}\\{}\\{}", &pack_name[..idx], locale, &pack_name[idx + 1..])
+    } else {
+        format!("{}\\{}", locale, pack_name)
+    }
+}
+
 fn process_cfg(config: &mut Config, cfg: Cfg) {
+    // Collect locale-specific files to emit as separate packs at the end
+    let mut locale_packs: BTreeMap<String, (bool, Vec<String>)> = BTreeMap::new();
+
     for (k, v) in cfg.pack {
+        let pack_name = format!("pack\\{}.pk", k).to_lowercase();
+
         let cmd = Command::Pack {
-            filename: format!("pack\\{}.pk", k),
+            filename: pack_name.clone(),
             force_compression: v.compress,
         };
         push_command(config, cmd);
 
         for dir in v.dirs {
-            let cmd = Command::AddDir(DirSpec {
-                directory: dir,
-                recurse_subdirectories: true,
-                filter_wildcard: String::new(),
-            });
-            push_command(config, cmd);
+            push_command(config, Command::AddDir(parse_dir_spec(&dir)));
         }
 
         for dir in v.exclude_dirs {
-            let cmd = Command::RemDir(DirSpec {
-                directory: dir,
-                recurse_subdirectories: true,
-                filter_wildcard: String::new(),
-            });
-            push_command(config, cmd);
+            push_command(config, Command::RemDir(parse_dir_spec(&dir)));
         }
 
         for filename in v.files {
-            let cmd = if let Some(dir) = hidden_glob(&filename) {
-                Command::AddDir(dir)
+            let filename = filename.to_lowercase();
+            if let Some(locale) = detect_locale(&filename) {
+                // Route locale-specific files to their own pack
+                let locale_pack = localize_pack_name(&pack_name, &locale);
+                log::debug!("Routing {} to locale pack {}", filename, locale_pack);
+                locale_packs
+                    .entry(locale_pack)
+                    .or_insert_with(|| (v.compress, Vec::new()))
+                    .1
+                    .push(filename);
             } else {
-                Command::AddFile { filename }
-            };
-            push_command(config, cmd);
+                let cmd = if let Some(dir) = hidden_glob(&filename) {
+                    Command::AddDir(dir)
+                } else {
+                    Command::AddFile { filename }
+                };
+                push_command(config, cmd);
+            }
         }
 
         for filename in v.exclude_files {
+            let filename = filename.to_lowercase();
             let cmd = if let Some(dir) = hidden_glob(&filename) {
                 Command::RemDir(dir)
             } else {
@@ -95,6 +162,29 @@ fn process_cfg(config: &mut Config, cfg: Cfg) {
             push_command(config, cmd);
         }
 
+        push_command(config, Command::EndPack);
+    }
+
+    // Emit locale-specific packs
+    for (locale_pack_name, (compress, files)) in locale_packs {
+        if files.is_empty() {
+            continue;
+        }
+        log::info!(
+            "Generating locale pack {} with {} files",
+            locale_pack_name,
+            files.len()
+        );
+        push_command(
+            config,
+            Command::Pack {
+                filename: locale_pack_name,
+                force_compression: compress,
+            },
+        );
+        for filename in files {
+            push_command(config, Command::AddFile { filename });
+        }
         push_command(config, Command::EndPack);
     }
 }

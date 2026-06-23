@@ -7,6 +7,7 @@ use log::LevelFilter;
 
 mod cache;
 mod config;
+mod finalize;
 mod pack;
 mod pki;
 
@@ -24,6 +25,7 @@ struct Args {
 #[argh(subcommand)]
 pub enum Commands {
     Cache(cache::Args),
+    Finalize(finalize::Args),
     Pack(pack::Args),
     PKI(pki::Args),
 }
@@ -161,6 +163,9 @@ fn main() -> color_eyre::Result<()> {
     match args.nested {
         Commands::Cache(cmd) => {
             cache::run(ProjectArgs::new(dir, config.general, project, name, cmd))
+        }
+        Commands::Finalize(cmd) => {
+            finalize::run(ProjectArgs::new(dir, config.general, project, name, cmd))
         }
         Commands::Pack(cmd) => pack::run(ProjectArgs::new(dir, config.general, project, name, cmd)),
         Commands::PKI(cmd) => pki::run(ProjectArgs::new(dir, config.general, project, name, cmd)),

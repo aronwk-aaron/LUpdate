@@ -124,8 +124,6 @@ pub fn run(args: ProjectArgs<Args>) -> color_eyre::Result<()> {
                 });
 
                 let is_compressed = lookup.category & 0xFF > 0;
-                let raw = file.raw;
-                let compressed = file.compressed;
 
                 let path = if is_compressed {
                     output.join(file.to_path())
@@ -134,8 +132,10 @@ pub fn run(args: ProjectArgs<Args>) -> color_eyre::Result<()> {
                     win_join(&paths.proj_dir, relative_name)
                 };
 
+                log::info!("Packing '{}' from '{}' (compressed={})", name, path.display(), is_compressed);
                 let mut writer = Writer { path: &path };
-                pk.put_file(crc, &mut writer, raw, compressed, is_compressed)?;
+                pk.put_file(crc, &mut writer, file, is_compressed)
+                    .with_context(|| format!("Failed to pack '{}' from '{}'", name, path.display()))?;
             }
         }
     }

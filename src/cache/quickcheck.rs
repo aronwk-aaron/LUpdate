@@ -4,8 +4,9 @@ use std::{
     io::{self, BufRead, BufReader, BufWriter, Write},
 };
 
-use assembly_pack::{crc::calculate_crc, md5::MD5Sum, txt::FileMeta};
+use assembly_pack::{crc::{calculate_crc, CRC}, md5::MD5Sum, txt::FileMeta};
 
+#[derive(Clone)]
 pub(super) struct QuickCheck {
     pub path: String,
     pub mtime: Option<f64>,
@@ -27,7 +28,7 @@ impl QuickCheck {
     }
 }
 
-pub(super) fn scan_quickcheck<R: io::Read>(reader: &mut R) -> BTreeMap<u32, QuickCheck> {
+pub(super) fn scan_quickcheck<R: io::Read>(reader: &mut R) -> BTreeMap<CRC, QuickCheck> {
     let mut quickcheck = BTreeMap::new();
     let mut reader = BufReader::new(reader);
     let mut buffer = String::new();

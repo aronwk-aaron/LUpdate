@@ -4,18 +4,20 @@ use assembly_pack::{
         fs::{scan_dir, FileInfo, FsVisitor},
         FileMetaPair,
     },
-    crc::calculate_crc,
+    crc::{calculate_crc, CRC},
     md5::{self, MD5Sum},
-    sd0::fs::Converter,
-    txt::{FileLine, Manifest, VersionLine},
+    sd0::fs::{Compression, Converter},
+    txt::{FileLine, FileMeta, Manifest, VersionLine},
 };
 use color_eyre::eyre::Context;
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use rayon::prelude::*;
 use std::{
     collections::BTreeMap,
     fs::{File, Metadata},
     io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, UNIX_EPOCH},
 };
 
@@ -51,6 +53,14 @@ pub struct Args {
     /// name of a file containing one path per line
     #[argh(option, short = 'F')]
     files: Option<PathBuf>,
+
+    /// compression level 0-9 (default: 1, fastest; 9 = smallest but slowest)
+    #[argh(option, short = 'c', default = "1")]
+    compression: u32,
+
+    /// number of parallel compression threads (default: all cores)
+    #[argh(option, short = 'j')]
+    jobs: Option<usize>,
 }
 
 fn hash_to_path(hash: &MD5Sum) -> String {
@@ -65,52 +75,47 @@ fn hash_to_path(hash: &MD5Sum) -> String {
 #[derive(Default, Debug)]
 struct Stats {
     quickcheck: usize,
+    cached_sd0: usize,
+    unchanged: usize,
     compress: usize,
-    updated: usize,
     total: usize,
     ignored: usize,
+}
+
+/// A file that needs SD0 compression (queued during scan, processed in parallel)
+struct PendingCompression {
+    path: String,
+    input: PathBuf,
+    outpath: PathBuf,
+    raw_meta: FileMeta,
+    mtime: Option<f64>,
+}
+
+/// Result of a successful parallel compression
+struct CompressResult {
+    path: String,
+    meta_pair: FileMetaPair,
+    linesum: MD5Sum,
+    mtime: Option<f64>,
+    raw_meta: FileMeta,
 }
 
 struct Visitor {
     stats: Stats,
     include_glob: GlobSet,
     exclude_glob: GlobSet,
-    quickcheck: BTreeMap<u32, QuickCheck>,
+    quickcheck: BTreeMap<CRC, QuickCheck>,
     quickcheck_out: BufWriter<File>,
-    conv: Converter,
     output: PathBuf,
     /// The previous manifest
     prev: BTreeMap<String, FileLine>,
     /// The new manifest
     manifest: Manifest,
+    /// Files queued for parallel compression
+    pending: Vec<PendingCompression>,
 }
 
 impl Visitor {
-    fn compress(&mut self, input: &Path, outpath: &Path) -> Option<FileMetaPair> {
-        // Continue with conversion if it was just not found
-        let parent = outpath.parent().unwrap();
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            log::error!("Failed to create dir {}:\n\t{}", parent.display(), e);
-            return None;
-        }
-        log::info!("Converting {} to {}", input.display(), outpath.display());
-        match self.conv.convert_file(input, &outpath) {
-            Err(e) => {
-                log::error!(
-                    "Error converting {} to {}:\n\t{}",
-                    input.display(),
-                    outpath.display(),
-                    e
-                );
-                return None;
-            }
-            Ok(line) => {
-                self.stats.compress += 1;
-                Some(line)
-            }
-        }
-    }
-
     fn visit(&mut self, path: String, input: &Path, meta: Option<Metadata>) {
         if !self.include_glob.is_match(&path) || self.exclude_glob.is_match(&path) {
             self.stats.ignored += 1;
@@ -128,7 +133,6 @@ impl Visitor {
         let quickcheck = self.quickcheck.remove(&crc);
 
         let in_meta = match quickcheck {
-            // FIXME: size check
             Some(qc) if (mtime.is_some() && qc.mtime == mtime) => {
                 self.stats.quickcheck += 1;
                 qc.meta
@@ -146,7 +150,6 @@ impl Visitor {
         let mut meta_pair = old_meta_pair.filter(|(p, _)| p.raw == in_meta);
 
         if let (Some(old), None) = (old_meta_pair.as_ref(), meta_pair.as_ref()) {
-            self.stats.updated += 1;
             log::debug!(
                 "File {} was updated from {} to {}",
                 path,
@@ -158,25 +161,37 @@ impl Visitor {
         let outpath = self.output.join(hash_to_path(&in_meta.hash));
 
         if meta_pair.is_none() {
-            let line = match md5::md5sum(&outpath) {
-                Ok(meta) => FileMetaPair {
-                    raw: in_meta,
-                    compressed: meta,
-                },
+            match md5::md5sum(&outpath) {
+                Ok(compressed_meta) => {
+                    // SD0 file already exists in cache, reuse it
+                    self.stats.cached_sd0 += 1;
+                    let line = FileMetaPair {
+                        raw: in_meta,
+                        compressed: compressed_meta,
+                    };
+                    let linesum = md5::MD5Sum::compute(&format!("{path},{line}"));
+                    meta_pair = Some((line, linesum));
+                }
                 Err(e) => {
                     if e.kind() != ErrorKind::NotFound {
                         log::error!("Failed to access {}:\n\t{}", outpath.display(), e);
                         return;
                     }
-                    let Some(meta_pair) = self.compress(input, &outpath) else {
-                        return
-                    };
-                    meta_pair
+                    // Queue for parallel compression
+                    self.pending.push(PendingCompression {
+                        path,
+                        input: input.to_owned(),
+                        outpath,
+                        raw_meta: in_meta,
+                        mtime,
+                    });
+                    return; // will be handled after parallel compression
                 }
             };
-            let linesum = md5::MD5Sum::compute(&format!("{path},{line}"));
-            meta_pair = Some((line, linesum));
+        } else {
+            self.stats.unchanged += 1;
         }
+
         if let Some((meta_pair, linesum)) = meta_pair {
             let qc = QuickCheck {
                 path: path.clone(),
@@ -184,7 +199,6 @@ impl Visitor {
                 meta: in_meta,
             };
             qc.write(&mut self.quickcheck_out).unwrap();
-
             self.manifest.files.insert(path, (meta_pair, linesum));
         }
     }
@@ -206,7 +220,6 @@ impl Visitor {
         let meta = match std::fs::metadata(&real) {
             Ok(meta) => Some(meta),
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                // If the file is explicitly listed but was no found, remove it
                 log::warn!("File {:?} not found!", path);
                 let crc = calculate_crc(path.as_bytes());
                 if let Some(_) = self.quickcheck.remove(&crc) {
@@ -215,7 +228,7 @@ impl Visitor {
                 if let Some(_) = self.prev.remove(&path) {
                     log::info!("Removed {:?} from manifest", path);
                 }
-                return; // don't visit this file
+                return;
             }
             Err(e) => {
                 log::debug!("Failed to get file metadata: {}", e);
@@ -225,7 +238,6 @@ impl Visitor {
         self.visit(path, &real, meta);
     }
 
-    /// Small generic function that calls [`do_scan_file`] on every line of its input
     fn do_scan_files<R: Read>(
         &mut self,
         file_list_reader: R,
@@ -234,7 +246,7 @@ impl Visitor {
     ) -> color_eyre::Result<()> {
         let files = BufReader::new(file_list_reader);
         let strip_prefix = match relative {
-            true => "", // don't try to strip a prefix on relative paths
+            true => "",
             false => &paths.strip_prefix,
         };
         for line in files.lines() {
@@ -258,11 +270,82 @@ impl Visitor {
             self.do_scan_files(file_list_reader, paths, relative)
         }
     }
+
+    /// Process all queued files in parallel, then merge results into the manifest.
+    fn flush_pending(&mut self, compression_level: u32) {
+        if self.pending.is_empty() {
+            return;
+        }
+
+        let count = self.pending.len();
+        log::info!(
+            "Compressing {} files in parallel (level {})",
+            count,
+            compression_level
+        );
+
+        let compressed_count = AtomicUsize::new(0);
+
+        let results: Vec<Option<CompressResult>> = self
+            .pending
+            .par_iter()
+            .map(|p| {
+                let i = compressed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                log::info!("[{}/{}] Compressing {}", i, count, p.input.display());
+
+                if let Some(parent) = p.outpath.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+
+                let conv = Converter {
+                    generate_segment_index: false,
+                    compression: Some(Compression::new(compression_level)),
+                };
+                let pair = conv
+                    .convert_file(&p.input, &p.outpath)
+                    .map_err(|e| {
+                        log::error!("Failed to compress {}: {}", p.input.display(), e);
+                        e
+                    })
+                    .ok()?;
+
+                let linesum = MD5Sum::compute(&format!("{},{}", p.path, pair));
+
+                Some(CompressResult {
+                    path: p.path.clone(),
+                    meta_pair: pair,
+                    linesum,
+                    mtime: p.mtime,
+                    raw_meta: p.raw_meta,
+                })
+            })
+            .collect();
+
+        // Merge results back sequentially
+        let pending = std::mem::take(&mut self.pending);
+        let mut compress_count = 0usize;
+        for (_, result) in pending.into_iter().zip(results.into_iter()) {
+            if let Some(r) = result {
+                compress_count += 1;
+                let qc = QuickCheck {
+                    path: r.path.clone(),
+                    mtime: r.mtime,
+                    meta: r.raw_meta,
+                };
+                qc.write(&mut self.quickcheck_out).unwrap();
+                self.manifest.files.insert(r.path, (r.meta_pair, r.linesum));
+            }
+        }
+        self.stats.compress += compress_count;
+        log::info!("Compressed {} files", compress_count);
+    }
 }
 
 impl FsVisitor for Visitor {
-    fn visit_file(&mut self, info: FileInfo) {
-        self.visit(info.path(), info.real(), info.metadata().ok())
+    fn visit_file<F: FileInfo>(&mut self, info: F) {
+        // Normalize virtual paths to lowercase for case-insensitive consistency
+        // (LU is a Windows game; all paths should be case-insensitive)
+        self.visit(info.path().to_lowercase(), info.real(), info.metadata().ok())
     }
 }
 
@@ -287,6 +370,22 @@ fn exclude_glob(project: &ProjectConfig) -> Result<GlobSet, globset::Error> {
 }
 
 pub fn run(args: ProjectArgs<Args>) -> color_eyre::Result<()> {
+    let compression_level = args.cmd.compression;
+    if compression_level > 9 {
+        return Err(color_eyre::eyre::eyre!(
+            "Compression level must be 0-9, got {}",
+            compression_level
+        ));
+    }
+
+    // Configure rayon thread pool
+    if let Some(jobs) = args.cmd.jobs {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            .build_global()
+            .ok(); // ignore if already initialized
+    }
+
     let paths = args.paths();
 
     let quickcheck_path = paths
@@ -329,6 +428,12 @@ pub fn run(args: ProjectArgs<Args>) -> color_eyre::Result<()> {
         _ => BTreeMap::new(),
     };
 
+    log::info!(
+        "Compression level: {}, threads: {}",
+        compression_level,
+        args.cmd.jobs.unwrap_or_else(|| rayon::current_num_threads())
+    );
+
     let mut visitor = Visitor {
         include_glob,
         exclude_glob,
@@ -340,10 +445,8 @@ pub fn run(args: ProjectArgs<Args>) -> color_eyre::Result<()> {
             version,
             files: BTreeMap::new(),
         },
-        conv: Converter {
-            generate_segment_index: false,
-        },
         output,
+        pending: Vec::new(),
     };
 
     log::info!("Scanning {} as {}", proj_dir.display(), paths.prefix);
@@ -351,19 +454,22 @@ pub fn run(args: ProjectArgs<Args>) -> color_eyre::Result<()> {
     if let Some(file_list_path) = args.cmd.files {
         visitor.scan_files(&file_list_path, &paths, args.cmd.relative)?;
         // Write out untouched manifest files
-        for (key, value) in visitor.prev {
+        for (key, value) in std::mem::take(&mut visitor.prev) {
             visitor.manifest.files.insert(key, value);
         }
         // Write out untouched quickcheck files
-        for (_key, value) in visitor.quickcheck {
+        for (_key, value) in std::mem::take(&mut visitor.quickcheck) {
             value.write(&mut visitor.quickcheck_out)?;
         }
     } else {
         scan_dir(&mut visitor, paths.prefix, &proj_dir, true);
-        for (k, _v) in visitor.prev {
+        for (k, _v) in &visitor.prev {
             log::info!("File {} was removed", k);
         }
     }
+
+    // Process all queued compressions in parallel
+    visitor.flush_pending(compression_level);
 
     manifest::write_manifest(visitor.manifest, &manifest).context("Failed to write manifest")?;
 
