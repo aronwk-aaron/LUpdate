@@ -7,7 +7,6 @@ use color_eyre::eyre::Context;
 use indexmap::IndexMap;
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap,
     ffi::OsStr,
     fs::File,
     io::{BufRead, BufReader, BufWriter},
@@ -77,45 +76,16 @@ fn parse_dir_spec(spec: &str) -> DirSpec {
     }
 }
 
-/// Detect a locale directory pattern in a path (e.g. `_loc\en_gb`, `_loc\de_de`).
-/// Returns the locale segment like `_loc\de_de` if found.
-fn detect_locale(path: &str) -> Option<String> {
-    let lower = path.to_lowercase();
-    let idx = lower.find("_loc\\")?;
-    let after = &lower[idx + 5..];
-    let mut chars = after.chars();
-    let c0 = chars.next().filter(|c| c.is_ascii_alphanumeric())?;
-    let c1 = chars.next().filter(|c| c.is_ascii_alphanumeric())?;
-    let c2 = chars.next().filter(|&c| c == '_')?;
-    let c3 = chars.next().filter(|c| c.is_ascii_alphanumeric())?;
-    let c4 = chars.next().filter(|c| c.is_ascii_alphanumeric())?;
-    let locale: String = [c0, c1, c2, c3, c4].iter().collect();
-    if !locale.is_empty() {
-        Some(format!("_loc\\{}", locale))
-    } else {
-        None
-    }
-}
-
-/// Remap a pack name to include a locale segment after the first component.
-/// `pack\front2_3.pk` + `_loc\de_de` → `pack\_loc\de_de\front2_3.pk`
-fn localize_pack_name(pack_name: &str, locale: &str) -> String {
-    if let Some(idx) = pack_name.find('\\') {
-        format!("{}\\{}\\{}", &pack_name[..idx], locale, &pack_name[idx + 1..])
-    } else {
-        format!("{}\\{}", locale, pack_name)
-    }
-}
-
 fn process_cfg(config: &mut Config, cfg: Cfg) {
-    // Collect locale-specific files to emit as separate packs at the end
-    let mut locale_packs: BTreeMap<String, (bool, Vec<String>)> = BTreeMap::new();
-
+    // NOTE: locale-specific files (paths containing `_loc\<locale>\`) are
+    // routed into per-locale packs by assembly-pack's pki generator itself;
+    // routing them here as well produced doubled names like
+    // `pack\_loc\de_de\_loc\de_de\front2_3.pk`.
     for (k, v) in cfg.pack {
         let pack_name = format!("pack\\{}.pk", k).to_lowercase();
 
         let cmd = Command::Pack {
-            filename: pack_name.clone(),
+            filename: pack_name,
             force_compression: v.compress,
         };
         push_command(config, cmd);
@@ -130,23 +100,12 @@ fn process_cfg(config: &mut Config, cfg: Cfg) {
 
         for filename in v.files {
             let filename = filename.to_lowercase();
-            if let Some(locale) = detect_locale(&filename) {
-                // Route locale-specific files to their own pack
-                let locale_pack = localize_pack_name(&pack_name, &locale);
-                log::debug!("Routing {} to locale pack {}", filename, locale_pack);
-                locale_packs
-                    .entry(locale_pack)
-                    .or_insert_with(|| (v.compress, Vec::new()))
-                    .1
-                    .push(filename);
+            let cmd = if let Some(dir) = hidden_glob(&filename) {
+                Command::AddDir(dir)
             } else {
-                let cmd = if let Some(dir) = hidden_glob(&filename) {
-                    Command::AddDir(dir)
-                } else {
-                    Command::AddFile { filename }
-                };
-                push_command(config, cmd);
-            }
+                Command::AddFile { filename }
+            };
+            push_command(config, cmd);
         }
 
         for filename in v.exclude_files {
@@ -159,29 +118,6 @@ fn process_cfg(config: &mut Config, cfg: Cfg) {
             push_command(config, cmd);
         }
 
-        push_command(config, Command::EndPack);
-    }
-
-    // Emit locale-specific packs
-    for (locale_pack_name, (compress, files)) in locale_packs {
-        if files.is_empty() {
-            continue;
-        }
-        log::info!(
-            "Generating locale pack {} with {} files",
-            locale_pack_name,
-            files.len()
-        );
-        push_command(
-            config,
-            Command::Pack {
-                filename: locale_pack_name,
-                force_compression: compress,
-            },
-        );
-        for filename in files {
-            push_command(config, Command::AddFile { filename });
-        }
         push_command(config, Command::EndPack);
     }
 }
@@ -224,7 +160,31 @@ pub fn run(args: ProjectArgs<Args>) -> color_eyre::Result<()> {
     }
 
     let output = config.output.clone();
-    let pki = config.run();
+    let mut pki = config.run();
+
+    // Prune archives that own zero files in the final CRC map. Duplicate
+    // dir/file claims across packs are resolved first-wins, which can leave a
+    // later pack empty; the original NetDevil pki never listed such packs,
+    // and the vanilla patcher errors on any pki archive missing from the
+    // manifest (it is never written to disk, so it never enters trunk.txt).
+    let mut file_counts = vec![0u32; pki.archives.len()];
+    for file_ref in pki.files.values() {
+        file_counts[file_ref.pack_file as usize] += 1;
+    }
+    let mut remap = vec![0u32; pki.archives.len()];
+    let mut kept = Vec::with_capacity(pki.archives.len());
+    for (index, archive) in pki.archives.iter().enumerate() {
+        if file_counts[index] > 0 {
+            remap[index] = kept.len() as u32;
+            kept.push(archive.clone());
+        } else {
+            log::warn!("Pruning empty pack {}", archive.path);
+        }
+    }
+    for file_ref in pki.files.values_mut() {
+        file_ref.pack_file = remap[file_ref.pack_file as usize];
+    }
+    pki.archives = kept;
 
     log::info!("number of archives: {}", pki.archives.len());
     log::info!("number of files: {}", pki.files.len());
