@@ -1,5 +1,7 @@
 use argh::FromArgs;
 use assembly_pack::{
+    common::fs::{scan_dir, FileInfo, FsVisitor},
+    crc::CRC,
     pki::{self, gen::Config, writer::write_pki_file},
     txt::gen::{push_command, Command, DirSpec},
 };
@@ -7,9 +9,10 @@ use color_eyre::eyre::Context;
 use indexmap::IndexMap;
 use serde::Deserialize;
 use std::{
+    collections::BTreeMap,
     ffi::OsStr,
     fs::File,
-    io::{BufRead, BufReader, BufWriter},
+    io::{BufRead, BufReader},
 };
 
 use crate::ProjectArgs;
@@ -73,6 +76,26 @@ fn parse_dir_spec(spec: &str) -> DirSpec {
         directory,
         recurse_subdirectories: recurse,
         filter_wildcard: filter,
+    }
+}
+
+/// All file names under a directory, by CRC
+#[derive(Default)]
+struct CrcNames {
+    seen: BTreeMap<CRC, Vec<String>>,
+}
+
+impl CrcNames {
+    fn colliding(&self) -> Vec<CRC> {
+        let many = self.seen.iter().filter(|(_, names)| names.len() > 1);
+        many.map(|(crc, _)| *crc).collect()
+    }
+}
+
+impl FsVisitor for CrcNames {
+    fn visit_file<F: FileInfo>(&mut self, info: F) {
+        let path = info.path().to_lowercase();
+        self.seen.entry(CRC::from_path(&path)).or_default().push(path);
     }
 }
 
@@ -160,7 +183,21 @@ pub fn run(args: ProjectArgs<Args>) -> color_eyre::Result<()> {
     }
 
     let output = config.output.clone();
+    let scan_root = config.directory.clone();
+    let scan_prefix = config.prefix.clone();
     let mut pki = config.run();
+
+    // Files are looked up by CRC alone, so two names with one CRC can't share
+    // the index: the client would be handed the same bytes for both (this hit
+    // `lod2\\57563.g` and a particle effect). Without an entry each loads from
+    // its own loose file, which the manifest delivers as usual.
+    let mut names = CrcNames::default();
+    scan_dir(&mut names, scan_prefix, &scan_root, true);
+    for crc in names.colliding() {
+        if pki.files.remove(&crc).is_some() {
+            log::warn!("Keeping {:?} out of the pack index: same CRC", names.seen[&crc]);
+        }
+    }
 
     // Prune archives that own zero files in the final CRC map. Duplicate
     // dir/file claims across packs are resolved first-wins, which can leave a
@@ -190,10 +227,26 @@ pub fn run(args: ProjectArgs<Args>) -> color_eyre::Result<()> {
     log::info!("number of files: {}", pki.files.len());
     log::info!("Writing to {}", output.display());
 
-    let file = File::create(&output).context("Failed to create output file")?;
-
-    let mut writer = BufWriter::new(file);
-    write_pki_file(&mut writer, &pki).context("Failed to write PKI file")?;
+    crate::fsutil::atomic_write(&output, |writer| write_pki_file(writer, &pki))
+        .context("Failed to write PKI file")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_collision_is_detected() {
+        let mut names = CrcNames::default();
+        for path in [
+            "client\\res\\brickprimitives\\lod2\\57563.g",
+            "client\\res\\forkp\\effects\\celebration\\celebrationsentinelsword\\celebrationsentinelsword4.psb",
+            "client\\res\\unrelated.dds",
+        ] {
+            names.seen.entry(CRC::from_path(path)).or_default().push(path.to_string());
+        }
+        assert_eq!(names.colliding(), vec![CRC::from_raw(2708661638)]);
+    }
 }

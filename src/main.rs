@@ -8,8 +8,10 @@ use log::LevelFilter;
 mod cache;
 mod config;
 mod finalize;
+mod fsutil;
 mod pack;
 mod pki;
+mod verify;
 
 #[derive(FromArgs, PartialEq, Debug)]
 /// CLI to update a patch server
@@ -28,6 +30,7 @@ pub enum Commands {
     Finalize(finalize::Args),
     Pack(pack::Args),
     PKI(pki::Args),
+    Verify(verify::Args),
 }
 
 #[derive(PartialEq, Debug)]
@@ -140,6 +143,12 @@ fn main() -> color_eyre::Result<()> {
         .filter_module("globset", LevelFilter::Info)
         .init();
 
+    log::info!(
+        "lupdate {} (assembly-pack {})",
+        env!("LUPDATE_GIT"),
+        env!("ASSEMBLY_GIT")
+    );
+
     let args: Args = argh::from_env();
     //let dir = std::env::current_dir().wrap_err("Failed to get current directory")?;
     let dir = PathBuf::from(".");
@@ -169,5 +178,8 @@ fn main() -> color_eyre::Result<()> {
         }
         Commands::Pack(cmd) => pack::run(ProjectArgs::new(dir, config.general, project, name, cmd)),
         Commands::PKI(cmd) => pki::run(ProjectArgs::new(dir, config.general, project, name, cmd)),
+        Commands::Verify(cmd) => {
+            verify::run(ProjectArgs::new(dir, config.general, project, name, cmd))
+        }
     }
 }

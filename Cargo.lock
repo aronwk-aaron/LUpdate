@@ -370,6 +370,7 @@ dependencies = [
  "assembly-pack",
  "color-eyre",
  "env_logger",
+ "flate2",
  "globset",
  "indexmap",
  "log",

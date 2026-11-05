@@ -1,31 +1,20 @@
 use std::{
-    collections::HashSet,
-    fs::{self, File},
-    io::{BufRead, BufReader, BufWriter, Write},
+    collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
 };
 
 use argh::FromArgs;
 use assembly_pack::{
-    crc::calculate_crc,
     md5::{self, MD5Sum},
-    pki::parser::parse_pki_file,
-    sd0::fs::Converter,
+    txt::{LineEnding, Manifest, VersionLine},
 };
 use color_eyre::eyre::Context;
 
-use crate::ProjectArgs;
-
-const CRLF: &str = "\r\n";
-
-const DEFAULT_FRONTEND_PACK_PATTERN: &str = "front";
-
-const EXCLUDE_PATTERNS: &[&str] = &[
-    ".git",
-    "generator_config.txt",
-    "generator_config_ci.txt",
-    "README.md",
-];
+use crate::{
+    fsutil::{atomic_write, convert_atomic},
+    ProjectArgs,
+};
 
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(subcommand, name = "finalize")]
@@ -43,13 +32,11 @@ pub struct Args {
     #[argh(option, default = "PathBuf::from(\"patcher\")")]
     patcher: PathBuf,
 
-    /// substring to match pack archive names for frontend (default: "front")
-    #[argh(option, default = "DEFAULT_FRONTEND_PACK_PATTERN.to_string()")]
-    frontend_pack_pattern: String,
 
     /// compression level 0-9 (default: 1, fastest; 9 = smallest but slowest)
     #[argh(option, short = 'c', default = "1")]
     compression: u32,
+
 }
 
 fn hash_to_path(hash: &MD5Sum) -> String {
@@ -60,54 +47,32 @@ fn hash_to_path(hash: &MD5Sum) -> String {
     format!("{}/{}/{}.sd0", c1, c2, hash_str)
 }
 
-/// Write a manifest file with CRLF line endings (matching LU client expectations)
-fn write_manifest_crlf(
-    path: &Path,
-    version_num: u32,
-    version_name: &str,
-    lines: &[String],
-) -> color_eyre::Result<()> {
-    let file = File::create(path)
-        .wrap_err_with(|| format!("Failed to create {}", path.display()))?;
-    let mut w = BufWriter::new(file);
-
-    let vnum_hash = MD5Sum::compute(&version_num.to_string());
-    write!(w, "[version]{CRLF}")?;
-    write!(w, "{},{},{}{CRLF}", version_num, vnum_hash, version_name)?;
-    write!(w, "[files]")?;
-    for line in lines {
-        write!(w, "{CRLF}{line}")?;
+fn new_manifest(version_num: u32, version_name: &str) -> Manifest {
+    Manifest {
+        version: VersionLine::new(version_num, version_name.to_owned()),
+        files: BTreeMap::new(),
     }
-
-    Ok(())
 }
 
-fn should_exclude(line: &str) -> bool {
-    EXCLUDE_PATTERNS.iter().any(|pat| line.contains(pat))
+/// Write a manifest the way the patcher expects it
+fn write_manifest(path: &Path, manifest: &Manifest) -> color_eyre::Result<()> {
+    atomic_write(path, |w| manifest.write(w, LineEnding::CrLf))
+        .wrap_err_with(|| format!("Failed to write {}", path.display()))
 }
 
-/// Read a manifest file, skipping the 3-line header, returning entry lines
-fn read_manifest_entries(path: &Path) -> color_eyre::Result<Vec<String>> {
-    let file = File::open(path)
-        .wrap_err_with(|| format!("Failed to open {}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut lines_iter = reader.lines();
+fn read_manifest(path: &Path) -> color_eyre::Result<Manifest> {
+    Manifest::from_file(path).wrap_err_with(|| format!("Failed to read {}", path.display()))
+}
 
-    // Skip header: [version], version line, [files]
-    for _ in 0..3 {
-        lines_iter.next();
-    }
-
-    let mut entries = Vec::new();
-    for line_result in lines_iter {
-        let line = line_result?;
-        let trimmed = line.trim().to_string();
-        if !trimmed.is_empty() {
-            entries.push(trimmed);
-        }
-    }
-
-    Ok(entries)
+/// Whether a manifest path is under an excluded name at the root of the project.
+///
+/// This compares whole path components. Substring matching dropped real files:
+/// `.git` as the regex the old script used also matches `digital_screen.psb`,
+/// `agitems.scm` and `build_section_agitate.kf`.
+fn should_exclude(path: &str, excluded: &[String]) -> bool {
+    let relative = path.split_once('/').map_or(path, |(_, rest)| rest);
+    let first = relative.split('/').next().unwrap_or_default();
+    excluded.iter().any(|x| x.eq_ignore_ascii_case(first))
 }
 
 /// Filter trunk.txt: normalize paths, lowercase, remove excluded entries, recalculate line hashes
@@ -116,99 +81,38 @@ fn filter_trunk(
     manifest_name: &str,
     version_num: u32,
     version_name: &str,
+    excluded: &[String],
 ) -> color_eyre::Result<()> {
     let trunk_path = cache_dir.join(manifest_name).with_extension("txt");
     log::info!("Filtering {}", trunk_path.display());
 
-    let entries = read_manifest_entries(&trunk_path)?;
-    let mut filtered = Vec::new();
-
-    for entry in entries {
-        // Normalize: backslash to forward slash, lowercase
-        let entry = entry.replace('\\', "/").to_lowercase();
-
-        if should_exclude(&entry) {
+    let mut filtered = new_manifest(version_num, version_name);
+    for (path, (meta, _)) in read_manifest(&trunk_path)?.files {
+        let path = path.replace('\\', "/").to_lowercase();
+        if should_exclude(&path, excluded) {
+            log::info!("Excluding {path} from trunk");
             continue;
         }
-
-        // Take first 5 fields, recalculate line hash
-        let fields: Vec<&str> = entry.split(',').collect();
-        if fields.len() < 5 {
-            continue;
-        }
-        let first_five = fields[..5].join(",");
-        let line_hash = MD5Sum::compute(&first_five);
-        filtered.push(format!("{first_five},{line_hash}"));
+        filtered.add_file(path, meta);
     }
 
-    log::info!("Filtered trunk: {} entries", filtered.len());
-    write_manifest_crlf(&trunk_path, version_num, version_name, &filtered)?;
-
-    Ok(())
+    log::info!("Filtered trunk: {} entries", filtered.files.len());
+    write_manifest(&trunk_path, &filtered)
 }
 
-/// Generate frontend.txt by including only trunk entries whose files belong to
-/// pack archives matching the given pattern (e.g. "front" matches front1.pk,
-/// ui1_front_1.pk, physics_front.pk, etc.)
+/// Generate frontend.txt, the manifest of the patcher's "download during play"
+/// option. It lists everything trunk.txt does, so both options install the game.
 fn generate_frontend(
     cache_dir: &Path,
     manifest_name: &str,
-    pki_name: &str,
     version_num: u32,
     version_name: &str,
-    pack_pattern: &str,
 ) -> color_eyre::Result<()> {
-    let pki_path = cache_dir.join(pki_name);
     let trunk_path = cache_dir.join(manifest_name).with_extension("txt");
-    let frontend_path = cache_dir.join("frontend.txt");
-
-    log::info!("Generating {} (packs matching '{}')", frontend_path.display(), pack_pattern);
-
-    let pki_data = fs::read(&pki_path)
-        .wrap_err_with(|| format!("Failed to read PKI {}", pki_path.display()))?;
-    let (_, pki) = parse_pki_file(&pki_data)
-        .map_err(|e| color_eyre::eyre::eyre!("Failed to parse PKI: {}", e))?;
-
-    let front_indices: HashSet<u32> = pki
-        .archives
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| a.path.to_lowercase().contains(pack_pattern))
-        .map(|(i, _)| i as u32)
-        .collect();
-
-    log::info!(
-        "Found {} frontend pack archives out of {}",
-        front_indices.len(),
-        pki.archives.len()
-    );
-
-    let front_crcs: HashSet<u32> = pki
-        .files
-        .iter()
-        .filter(|(_, file_ref)| front_indices.contains(&file_ref.pack_file))
-        .map(|(crc, _)| crc.to_raw())
-        .collect();
-
-    log::info!("Frontend packs contain {} files", front_crcs.len());
-
-    let entries = read_manifest_entries(&trunk_path)?;
-    let mut frontend_lines = Vec::new();
-
-    for entry in &entries {
-        if let Some(path) = entry.split(',').next() {
-            let path_backslash = path.replace('/', "\\");
-            let crc = calculate_crc(path_backslash.as_bytes()).to_raw();
-            if front_crcs.contains(&crc) {
-                frontend_lines.push(entry.clone());
-            }
-        }
-    }
-
-    log::info!("Frontend: {} of {} trunk entries", frontend_lines.len(), entries.len());
-    write_manifest_crlf(&frontend_path, version_num, version_name, &frontend_lines)?;
-
-    Ok(())
+    let mut frontend = new_manifest(version_num, version_name);
+    frontend.files = read_manifest(&trunk_path)?.files;
+    log::info!("Frontend: {} entries", frontend.files.len());
+    write_manifest(&cache_dir.join("frontend.txt"), &frontend)
 }
 
 /// Copy patcher.ini to cache dir
@@ -233,7 +137,7 @@ fn make_version(
     let output_path = cache_dir.join(filename);
     log::info!("Generating {}", output_path.display());
 
-    let mut lines = Vec::new();
+    let mut manifest = new_manifest(version_num, version_name);
 
     for &file in files {
         let file_path = cache_dir.join(file);
@@ -245,23 +149,13 @@ fn make_version(
         let compressed_path = cache_dir.join(hash_to_path(&raw_meta.hash));
 
         log::info!("Compressing {}", file_path.display());
-        let conv = Converter {
-            generate_segment_index: false,
-            compression: Some(compression_level),
-        };
-        let pair = conv
-            .convert_file(&file_path, &compressed_path)
+        let pair = convert_atomic(compression_level, &file_path, &compressed_path)
             .wrap_err_with(|| format!("Failed to compress {}", file_path.display()))?;
 
-        // Build manifest line with forward slashes
-        let file_normalized = file.replace('\\', "/");
-        let line_content = format!("{},{}", file_normalized, pair);
-        let line_hash = MD5Sum::compute(&line_content);
-        lines.push(format!("{line_content},{line_hash}"));
+        manifest.add_file(file.replace('\\', "/"), pair);
     }
 
-    write_manifest_crlf(&output_path, version_num, version_name, &lines)?;
-    Ok(())
+    write_manifest(&output_path, &manifest)
 }
 
 pub fn run(args: ProjectArgs<Args>) -> color_eyre::Result<()> {
@@ -278,19 +172,17 @@ pub fn run(args: ProjectArgs<Args>) -> color_eyre::Result<()> {
     );
 
     let compression_level = args.cmd.compression;
+    if compression_level > 9 {
+        return Err(color_eyre::eyre::eyre!(
+            "Compression level must be 0-9, got {compression_level}"
+        ));
+    }
 
     log::info!("[Finalize] Filtering trunk");
-    filter_trunk(cache_dir, manifest_name, vnum, &vname)?;
+    filter_trunk(cache_dir, manifest_name, vnum, &vname, &args.general.exclude_root)?;
 
     log::info!("[Finalize] Generating frontend");
-    generate_frontend(
-        cache_dir,
-        manifest_name,
-        &pki_name,
-        vnum,
-        &vname,
-        &args.cmd.frontend_pack_pattern,
-    )?;
+    generate_frontend(cache_dir, manifest_name, vnum, &vname)?;
 
     log::info!("[Finalize] Copying patcher.ini");
     copy_patcher(&args.cmd.patcher, cache_dir)?;
@@ -314,4 +206,34 @@ pub fn run(args: ProjectArgs<Args>) -> color_eyre::Result<()> {
     log::info!("[Finalize] Done");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exclusion_only_matches_configured_root_names() {
+        let excluded: Vec<String> = [".github", ".gitignore", "generator_config.txt", "README.md"]
+            .map(String::from)
+            .to_vec();
+        for clutter in [
+            "client/.github/workflows/build-cache.yml",
+            "client/generator_config.txt",
+            "client/readme.md",
+            "client/.gitignore",
+        ] {
+            assert!(should_exclude(clutter, &excluded), "{clutter}");
+        }
+        for content in [
+            "client/res/forkp/effects/environment/digital_screen/digital_screen.psb",
+            "client/res/macros/agitems.scm",
+            "client/res/animations/objects/build_section_agitate.kf",
+            "client/res/somewhere/readme.md",
+            "client/res/generator_config.txt",
+        ] {
+            assert!(!should_exclude(content, &excluded), "{content}");
+        }
+        assert!(!should_exclude("client/readme.md", &[]));
+    }
 }

@@ -4,28 +4,28 @@ use assembly_pack::{
         fs::{scan_dir, FileInfo, FsVisitor},
         FileMetaPair,
     },
-    crc::{calculate_crc, CRC},
     md5::{self, MD5Sum},
-    sd0::fs::Converter,
-    txt::{FileLine, FileMeta, Manifest, VersionLine},
+    txt::{FileMeta, LineEnding, Manifest, VersionLine},
 };
-use color_eyre::eyre::Context;
+use color_eyre::eyre::{eyre, Context};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::{File, Metadata},
-    io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom},
+    io::{ErrorKind, Read},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, UNIX_EPOCH},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    },
+    time::UNIX_EPOCH,
 };
 
-use crate::{cache::quickcheck::scan_quickcheck, config::ProjectConfig, Paths, ProjectArgs};
+use crate::{config::ProjectConfig, fsutil, ProjectArgs};
 
-use self::quickcheck::QuickCheck;
+use self::quickcheck::{scan_quickcheck, QuickCheck};
 
-mod manifest;
 mod quickcheck;
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -73,280 +73,181 @@ fn hash_to_path(hash: &MD5Sum) -> String {
 }
 
 #[derive(Default, Debug)]
+#[allow(dead_code)] // read through Debug
 struct Stats {
-    quickcheck: usize,
-    cached_sd0: usize,
-    unchanged: usize,
-    compress: usize,
+    /// Files found by the scan
     total: usize,
+    /// Files skipped by the include/exclude globs
+    ignored: usize,
+    /// Files whose md5 came from the quickcheck file (others were hashed)
+    quickcheck: usize,
+    /// Files whose sd0 the previous manifest already described
+    unchanged: usize,
+    /// Files whose sd0 was found in the cache and verified by decoding it
+    cached_sd0: usize,
+    /// Files needing a new sd0
+    compress: usize,
+    /// Distinct contents actually compressed (`compress` minus duplicates)
+    compressed_unique: usize,
+}
+
+/// A file found by the scan, not yet hashed
+struct ScanEntry {
+    path: String,
+    real: PathBuf,
+    mtime: Option<f64>,
+    size: Option<u64>,
+}
+
+fn mtime_of(meta: &Metadata) -> Option<f64> {
+    let mtime = meta.modified().ok()?;
+    Some(mtime.duration_since(UNIX_EPOCH).ok()?.as_secs_f64())
+}
+
+/// Everything that goes wrong during a scan; a file that can't be read must
+/// fail the build, not silently vanish from the manifest.
+#[derive(Default)]
+struct Scan {
+    include_glob: GlobSet,
+    exclude_glob: GlobSet,
+    entries: BTreeMap<String, ScanEntry>,
+    errors: Vec<String>,
     ignored: usize,
 }
 
-/// A file that needs SD0 compression (queued during scan, processed in parallel)
-struct PendingCompression {
-    path: String,
-    input: PathBuf,
-    outpath: PathBuf,
-    raw_meta: FileMeta,
-    mtime: Option<f64>,
-}
-
-/// Result of a successful parallel compression
-struct CompressResult {
-    path: String,
-    meta_pair: FileMetaPair,
-    linesum: MD5Sum,
-    mtime: Option<f64>,
-    raw_meta: FileMeta,
-}
-
-struct Visitor {
-    stats: Stats,
-    include_glob: GlobSet,
-    exclude_glob: GlobSet,
-    quickcheck: BTreeMap<CRC, QuickCheck>,
-    quickcheck_out: BufWriter<File>,
-    output: PathBuf,
-    /// The previous manifest
-    prev: BTreeMap<String, FileLine>,
-    /// The new manifest
-    manifest: Manifest,
-    /// Files queued for parallel compression
-    pending: Vec<PendingCompression>,
-}
-
-impl Visitor {
-    fn visit(&mut self, path: String, input: &Path, meta: Option<Metadata>) {
+impl Scan {
+    fn add(&mut self, path: String, real: &Path, meta: Option<Metadata>) {
         if !self.include_glob.is_match(&path) || self.exclude_glob.is_match(&path) {
-            self.stats.ignored += 1;
+            self.ignored += 1;
             return;
         }
-        self.stats.total += 1;
-        let crc = calculate_crc(path.as_bytes());
-        let mtime = meta
-            .as_ref()
-            .and_then(|meta| meta.modified().ok())
-            .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-            .as_ref()
-            .map(Duration::as_secs_f64);
-        let _size = meta.as_ref().map(Metadata::len);
-        let quickcheck = self.quickcheck.remove(&crc);
-
-        let in_meta = match quickcheck {
-            Some(qc) if (mtime.is_some() && qc.mtime == mtime) => {
-                self.stats.quickcheck += 1;
-                qc.meta
-            }
-            _ => match md5::md5sum(input) {
-                Ok(meta) => meta,
-                Err(e) => {
-                    log::error!("Failed to check {}:\n\t{}", input.display(), e);
-                    return;
-                }
-            },
+        let entry = ScanEntry {
+            path: path.clone(),
+            real: real.to_owned(),
+            mtime: meta.as_ref().and_then(mtime_of),
+            size: meta.as_ref().map(Metadata::len),
         };
-
-        let old_meta_pair = self.prev.remove(&path);
-        let mut meta_pair = old_meta_pair.filter(|(p, _)| p.raw == in_meta);
-
-        if let (Some(old), None) = (old_meta_pair.as_ref(), meta_pair.as_ref()) {
-            log::debug!(
-                "File {} was updated from {} to {}",
-                path,
-                old.0.raw.hash,
-                in_meta.hash
-            );
-        }
-
-        let outpath = self.output.join(hash_to_path(&in_meta.hash));
-
-        if meta_pair.is_none() {
-            match md5::md5sum(&outpath) {
-                Ok(compressed_meta) => {
-                    // SD0 file already exists in cache, reuse it
-                    self.stats.cached_sd0 += 1;
-                    let line = FileMetaPair {
-                        raw: in_meta,
-                        compressed: compressed_meta,
-                    };
-                    let linesum = md5::MD5Sum::compute(&format!("{path},{line}"));
-                    meta_pair = Some((line, linesum));
-                }
-                Err(e) => {
-                    if e.kind() != ErrorKind::NotFound {
-                        log::error!("Failed to access {}:\n\t{}", outpath.display(), e);
-                        return;
-                    }
-                    // Queue for parallel compression
-                    self.pending.push(PendingCompression {
-                        path,
-                        input: input.to_owned(),
-                        outpath,
-                        raw_meta: in_meta,
-                        mtime,
-                    });
-                    return; // will be handled after parallel compression
-                }
-            };
-        } else {
-            self.stats.unchanged += 1;
-        }
-
-        if let Some((meta_pair, linesum)) = meta_pair {
-            let qc = QuickCheck {
-                path: path.clone(),
-                mtime,
-                meta: in_meta,
-            };
-            qc.write(&mut self.quickcheck_out).unwrap();
-            self.manifest.files.insert(path, (meta_pair, linesum));
+        if let Some(old) = self.entries.insert(path.clone(), entry) {
+            // Would otherwise be resolved by directory order
+            self.errors.push(format!(
+                "{path} exists twice with different case: {} and {}",
+                old.real.display(),
+                real.display()
+            ));
         }
     }
 
-    fn do_scan_file(&mut self, real_proj_dir: &Path, line: &str, strip_prefix: &str) {
-        let path = line.replace('/', "\\");
-        let in_proj_path = match path.strip_prefix(strip_prefix) {
-            Some(o) => o.trim(),
-            None => {
-                log::warn!("Missing prefix {}: {}", strip_prefix, path);
-                return;
-            }
-        };
-        let real = {
-            let mut p = real_proj_dir.to_owned();
-            p.extend(in_proj_path.split('\\'));
-            p
-        };
-        let meta = match std::fs::metadata(&real) {
-            Ok(meta) => Some(meta),
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                log::warn!("File {:?} not found!", path);
-                let crc = calculate_crc(path.as_bytes());
-                if let Some(_) = self.quickcheck.remove(&crc) {
-                    log::debug!("Removed {:?} from quickcheck", path);
-                }
-                if let Some(_) = self.prev.remove(&path) {
-                    log::info!("Removed {:?} from manifest", path);
-                }
-                return;
-            }
-            Err(e) => {
-                log::debug!("Failed to get file metadata: {}", e);
-                None
-            }
-        };
-        self.visit(path, &real, meta);
-    }
-
-    fn do_scan_files<R: Read>(
+    /// Scan the files named in a list (`-F`)
+    fn scan_list<R: Read>(
         &mut self,
-        file_list_reader: R,
-        paths: &Paths,
-        relative: bool,
+        list: R,
+        proj_dir: &Path,
+        strip_prefix: &str,
+        prev: &mut BTreeMap<String, FileMetaPair>,
+        quickcheck: &mut BTreeMap<String, QuickCheck>,
     ) -> color_eyre::Result<()> {
-        let files = BufReader::new(file_list_reader);
-        let strip_prefix = match relative {
-            true => "",
-            false => &paths.strip_prefix,
-        };
-        for line in files.lines() {
-            self.do_scan_file(&paths.proj_dir, line?.as_str(), strip_prefix);
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(list).lines() {
+            let line = line?;
+            let line = line.trim().replace('/', "\\");
+            let Some(in_proj) = line.strip_prefix(strip_prefix) else {
+                log::warn!("Missing prefix {}: {}", strip_prefix, line);
+                continue;
+            };
+            let path = line.to_lowercase();
+            let mut real = proj_dir.to_owned();
+            real.extend(in_proj.split('\\'));
+            match std::fs::metadata(&real) {
+                Ok(meta) => self.add(path, &real, Some(meta)),
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    log::warn!("File {:?} not found!", line);
+                    quickcheck.remove(&path);
+                    if prev.remove(&path).is_some() {
+                        log::info!("Removed {:?} from manifest", path);
+                    }
+                }
+                Err(e) => self.errors.push(format!("{}: {e}", real.display())),
+            }
         }
         Ok(())
     }
-
-    fn scan_files(
-        &mut self,
-        file_list_path: &Path,
-        paths: &Paths,
-        relative: bool,
-    ) -> color_eyre::Result<()> {
-        if file_list_path == Path::new("-") {
-            self.do_scan_files(std::io::stdin(), paths, relative)
-        } else {
-            let file_list_reader = File::open(&file_list_path).wrap_err_with(|| {
-                format!("Failed to open files list: {}", file_list_path.display())
-            })?;
-            self.do_scan_files(file_list_reader, paths, relative)
-        }
-    }
-
-    /// Compress all queued files in parallel, then merge results into the manifest.
-    fn compress_pending(&mut self, compression_level: u32) {
-        if self.pending.is_empty() {
-            return;
-        }
-
-        let count = self.pending.len();
-        log::info!(
-            "Compressing {} files in parallel (level {})",
-            count,
-            compression_level
-        );
-
-        let compressed_count = AtomicUsize::new(0);
-
-        let results: Vec<Option<CompressResult>> = self
-            .pending
-            .par_iter()
-            .map(|p| {
-                let i = compressed_count.fetch_add(1, Ordering::Relaxed) + 1;
-                log::info!("[{}/{}] Compressing {}", i, count, p.input.display());
-
-                if let Some(parent) = p.outpath.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-
-                let conv = Converter {
-                    generate_segment_index: false,
-                    compression: Some(compression_level),
-                };
-                let pair = conv
-                    .convert_file(&p.input, &p.outpath)
-                    .map_err(|e| {
-                        log::error!("Failed to compress {}: {}", p.input.display(), e);
-                        e
-                    })
-                    .ok()?;
-
-                let linesum = MD5Sum::compute(&format!("{},{}", p.path, pair));
-
-                Some(CompressResult {
-                    path: p.path.clone(),
-                    meta_pair: pair,
-                    linesum,
-                    mtime: p.mtime,
-                    raw_meta: p.raw_meta,
-                })
-            })
-            .collect();
-
-        // Merge results back sequentially
-        let pending = std::mem::take(&mut self.pending);
-        let mut compress_count = 0usize;
-        for (_, result) in pending.into_iter().zip(results.into_iter()) {
-            if let Some(r) = result {
-                compress_count += 1;
-                let qc = QuickCheck {
-                    path: r.path.clone(),
-                    mtime: r.mtime,
-                    meta: r.raw_meta,
-                };
-                qc.write(&mut self.quickcheck_out).unwrap();
-                self.manifest.files.insert(r.path, (r.meta_pair, r.linesum));
-            }
-        }
-        self.stats.compress += compress_count;
-        log::info!("Compressed {} files", compress_count);
-    }
 }
 
-impl FsVisitor for Visitor {
+impl FsVisitor for Scan {
     fn visit_file<F: FileInfo>(&mut self, info: F) {
         // Normalize virtual paths to lowercase for case-insensitive consistency
         // (LU is a Windows game; all paths should be case-insensitive)
-        self.visit(info.path().to_lowercase(), info.real(), info.metadata().ok())
+        match info.metadata() {
+            Ok(meta) => self.add(info.path().to_lowercase(), info.real(), Some(meta)),
+            Err(e) => self.errors.push(format!("{}: {e}", info.real().display())),
+        }
     }
+
+    fn failed_read_dir(&mut self, real: &Path, e: std::io::Error) {
+        self.errors.push(format!("read_dir {}: {e}", real.display()));
+    }
+
+    fn failed_next_dir_entry(&mut self, real: &Path, e: std::io::Error) {
+        self.errors.push(format!("read_dir {}: {e}", real.display()));
+    }
+}
+
+/// How the sd0 for one distinct content was obtained
+enum Resolved {
+    Unchanged(FileMeta),
+    Cached(FileMeta),
+    Compressed(FileMeta),
+}
+
+impl Resolved {
+    fn compressed(&self) -> FileMeta {
+        match self {
+            Self::Unchanged(m) | Self::Cached(m) | Self::Compressed(m) => *m,
+        }
+    }
+}
+
+/// Get a valid sd0 for one distinct content.
+///
+/// A file already at the output path is only reused after decoding it: this
+/// path has no manifest vouching for it, and it may have been left by a crash
+/// or by a version of this tool that wrote bad sd0 files.
+fn resolve_sd0(
+    raw: &FileMeta,
+    input: &Path,
+    output: &Path,
+    known: Option<&FileMeta>,
+    level: u32,
+) -> Result<Resolved, String> {
+    let outpath = output.join(hash_to_path(&raw.hash));
+    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", input.display());
+
+    match std::fs::metadata(&outpath) {
+        Ok(on_disk) => {
+            if let Some(known) = known.filter(|k| u64::from(k.size) == on_disk.len()) {
+                return Ok(Resolved::Unchanged(*known));
+            }
+            match fsutil::inspect_sd0(&outpath) {
+                Ok(pair) if pair.raw == *raw => return Ok(Resolved::Cached(pair.compressed)),
+                Ok(pair) => log::warn!(
+                    "Replacing bad {}: decodes to {} instead of {}",
+                    outpath.display(),
+                    pair.raw.hash,
+                    raw.hash
+                ),
+                Err(e) => log::warn!("Replacing bad {}: {e}", outpath.display()),
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(fail(&e)),
+    }
+
+    let pair = fsutil::convert_atomic(level, input, &outpath).map_err(|e| fail(&e))?;
+    if pair.raw != *raw {
+        // Keeps a racing writer from publishing content the manifest doesn't describe
+        return Err(fail(&"changed while the cache was being built"));
+    }
+    Ok(Resolved::Compressed(pair.compressed))
 }
 
 fn include_glob(project: &ProjectConfig) -> Result<GlobSet, globset::Error> {
@@ -369,16 +270,46 @@ fn exclude_glob(project: &ProjectConfig) -> Result<GlobSet, globset::Error> {
     builder.build()
 }
 
+/// Read the previous manifest, if there is one.
+///
+/// `finalize` rewrites the manifest with lowercase `/` paths while the scan
+/// produces `\\` paths, so this has to normalize them or a finalized manifest
+/// would never match anything.
+fn load_prev(manifest: &Path) -> color_eyre::Result<BTreeMap<String, FileMetaPair>> {
+    match std::fs::metadata(manifest) {
+        Ok(m) if m.is_file() => {
+            let mf = Manifest::from_file(manifest)
+                .wrap_err_with(|| format!("Failed to parse {}", manifest.display()))?;
+            log::info!(
+                "Loaded previous manifest v{}: {} ({} files)",
+                mf.version.version,
+                mf.version.name,
+                mf.files.len()
+            );
+            Ok(mf
+                .files
+                .into_iter()
+                .map(|(k, (pair, _))| (k.replace('/', "\\"), pair))
+                .collect())
+        }
+        _ => Ok(BTreeMap::new()),
+    }
+}
+
+/// Log progress at most every 10%, keeping the build log readable
+fn progress(what: &str, done: &AtomicUsize, total: usize) {
+    let i = done.fetch_add(1, Ordering::Relaxed) + 1;
+    if total >= 1000 && i % (total / 10) == 0 {
+        log::info!("{what}: {i}/{total}");
+    }
+}
+
 pub fn run(args: ProjectArgs<Args>) -> color_eyre::Result<()> {
     let compression_level = args.cmd.compression;
     if compression_level > 9 {
-        return Err(color_eyre::eyre::eyre!(
-            "Compression level must be 0-9, got {}",
-            compression_level
-        ));
+        return Err(eyre!("Compression level must be 0-9, got {}", compression_level));
     }
 
-    // Configure rayon thread pool
     if let Some(jobs) = args.cmd.jobs {
         rayon::ThreadPoolBuilder::new()
             .num_threads(jobs)
@@ -387,93 +318,178 @@ pub fn run(args: ProjectArgs<Args>) -> color_eyre::Result<()> {
     }
 
     let paths = args.paths();
-
     let quickcheck_path = paths
         .cache_dir_parent
         .join(format!("{}.quickcheck.txt", args.name));
     let output = paths.cache_dir.clone();
     std::fs::create_dir_all(&output).wrap_err("Failed to create output dir")?;
+    let leftovers = fsutil::remove_leftovers(&output).wrap_err("Failed to clean output dir")?;
+    if leftovers > 0 {
+        log::warn!("Removed {leftovers} temp files left by an interrupted run");
+    }
 
-    let include_glob = include_glob(&args.project)?;
-    let exclude_glob = exclude_glob(&args.project)?;
+    let mut quickcheck = match File::open(&quickcheck_path) {
+        Ok(f) => scan_quickcheck(f),
+        Err(_) => BTreeMap::new(),
+    };
 
-    let mut _quickcheck = File::options()
-        .create(true)
-        .write(true)
-        .read(true)
-        .open(&quickcheck_path)?;
-    let quickcheck = scan_quickcheck(&mut _quickcheck);
-    _quickcheck.seek(SeekFrom::Start(0))?;
-    _quickcheck.set_len(0)?; // clear the file
-
-    let proj_dir = &paths.proj_dir;
-
-    let mf_name = &args.project.manifest;
-    let manifest = output.join(mf_name).with_extension("txt");
-
+    let manifest_path = output.join(&args.project.manifest).with_extension("txt");
     let vnum = args.cmd.version;
     let vname = args.cmd.name.unwrap_or_else(|| vnum.to_string());
     let version = VersionLine::new(vnum, vname);
-
-    let prev = match std::fs::metadata(&manifest) {
-        Ok(m) if m.is_file() => {
-            let mf = Manifest::from_file(&manifest)?;
-            log::info!(
-                "Loaded previous manifest v{}: {}",
-                mf.version.version,
-                mf.version.name
-            );
-            mf.files
-        }
-        _ => BTreeMap::new(),
-    };
+    let mut prev = load_prev(&manifest_path)?;
 
     log::info!(
         "Compression level: {}, threads: {}",
         compression_level,
-        args.cmd.jobs.unwrap_or_else(|| rayon::current_num_threads())
+        rayon::current_num_threads()
     );
+    log::info!("Scanning {} as {}", paths.proj_dir.display(), paths.prefix);
 
-    let mut visitor = Visitor {
-        include_glob,
-        exclude_glob,
-        stats: Stats::default(),
-        quickcheck,
-        quickcheck_out: BufWriter::new(_quickcheck),
-        prev,
-        manifest: Manifest {
-            version,
-            files: BTreeMap::new(),
-        },
-        output,
-        pending: Vec::new(),
+    let mut scan = Scan {
+        include_glob: include_glob(args.project)?,
+        exclude_glob: exclude_glob(args.project)?,
+        ..Scan::default()
     };
-
-    log::info!("Scanning {} as {}", proj_dir.display(), paths.prefix);
-
-    if let Some(file_list_path) = args.cmd.files {
-        visitor.scan_files(&file_list_path, &paths, args.cmd.relative)?;
-        // Write out untouched manifest files
-        for (key, value) in std::mem::take(&mut visitor.prev) {
-            visitor.manifest.files.insert(key, value);
-        }
-        // Write out untouched quickcheck files
-        for (_key, value) in std::mem::take(&mut visitor.quickcheck) {
-            value.write(&mut visitor.quickcheck_out)?;
+    let partial = args.cmd.files.is_some();
+    if let Some(list) = &args.cmd.files {
+        let strip = if args.cmd.relative { "" } else { paths.strip_prefix.as_str() };
+        if list == Path::new("-") {
+            scan.scan_list(std::io::stdin(), &paths.proj_dir, strip, &mut prev, &mut quickcheck)?;
+        } else {
+            let f = File::open(list)
+                .wrap_err_with(|| format!("Failed to open files list: {}", list.display()))?;
+            scan.scan_list(f, &paths.proj_dir, strip, &mut prev, &mut quickcheck)?;
         }
     } else {
-        scan_dir(&mut visitor, paths.prefix, &proj_dir, true);
-        for (k, _v) in &visitor.prev {
-            log::info!("File {} was removed", k);
+        scan_dir(&mut scan, paths.prefix.clone(), &paths.proj_dir, true);
+    }
+    let Scan { entries, mut errors, ignored, .. } = scan;
+
+    let mut stats = Stats {
+        total: entries.len(),
+        ignored,
+        ..Stats::default()
+    };
+
+    // 1. Hash whatever the quickcheck can't vouch for
+    let entries: Vec<ScanEntry> = entries.into_values().collect();
+    let total = entries.len();
+    let done = AtomicUsize::new(0);
+    let hashed: Vec<(usize, Option<FileMeta>, bool)> = entries
+        .par_iter()
+        .enumerate()
+        .map(|(i, e)| {
+            progress("Hashed", &done, total);
+            let qc = quickcheck.get(&e.path).filter(|qc| {
+                e.mtime.is_some() && qc.mtime == e.mtime && e.size == Some(u64::from(qc.meta.size))
+            });
+            if let Some(qc) = qc {
+                return (i, Some(qc.meta), true);
+            }
+            match md5::md5sum(&e.real) {
+                Ok(meta) => (i, Some(meta), false),
+                Err(err) => {
+                    log::error!("Failed to hash {}: {err}", e.real.display());
+                    (i, None, false)
+                }
+            }
+        })
+        .collect();
+
+    // 2. One sd0 per distinct content: entries sharing content share an output
+    // path, and a lot of game files are duplicates.
+    let known: HashMap<[u8; 16], FileMeta> = prev
+        .values()
+        .map(|pair| (pair.raw.hash.0, pair.compressed))
+        .collect();
+    let mut metas: Vec<Option<FileMeta>> = vec![None; total];
+    let mut unique: HashMap<[u8; 16], (FileMeta, usize)> = HashMap::new();
+    for (i, meta, from_qc) in hashed {
+        match meta {
+            Some(meta) => {
+                stats.quickcheck += usize::from(from_qc);
+                metas[i] = Some(meta);
+                unique.entry(meta.hash.0).or_insert((meta, i));
+            }
+            None => errors.push(format!("Failed to hash {}", entries[i].real.display())),
         }
     }
 
-    // Process all queued compressions in parallel
-    visitor.compress_pending(compression_level);
+    let unique: Vec<(FileMeta, usize)> = unique.into_values().collect();
+    log::info!("{} files, {} distinct contents", total, unique.len());
+    let done = AtomicUsize::new(0);
+    let failures = Mutex::new(Vec::new());
+    let resolved: HashMap<[u8; 16], Resolved> = unique
+        .par_iter()
+        .filter_map(|(raw, i)| {
+            progress("Resolved sd0", &done, unique.len());
+            let known = known.get(&raw.hash.0);
+            match resolve_sd0(raw, &entries[*i].real, &output, known, compression_level) {
+                Ok(r) => Some((raw.hash.0, r)),
+                Err(e) => {
+                    failures.lock().unwrap().push(e);
+                    None
+                }
+            }
+        })
+        .collect();
+    errors.extend(failures.into_inner().unwrap());
 
-    manifest::write_manifest(visitor.manifest, &manifest).context("Failed to write manifest")?;
+    // 3. Nothing is written unless every file is accounted for
+    if !errors.is_empty() {
+        errors.sort();
+        for e in &errors {
+            log::error!("{e}");
+        }
+        return Err(eyre!(
+            "{} files could not be cached; keeping the previous manifest",
+            errors.len()
+        ));
+    }
 
-    log::info!("{:?}", visitor.stats);
+    let mut manifest = Manifest { version, files: BTreeMap::new() };
+    let mut new_quickcheck = BTreeMap::new();
+    for (entry, meta) in entries.iter().zip(metas) {
+        let raw = meta.expect("errors were handled above");
+        let result = &resolved[&raw.hash.0];
+        match result {
+            Resolved::Unchanged(_) => stats.unchanged += 1,
+            Resolved::Cached(_) => stats.cached_sd0 += 1,
+            Resolved::Compressed(_) => stats.compress += 1,
+        }
+        manifest.add_file(entry.path.clone(), FileMetaPair::new(raw, result.compressed()));
+        let qc = QuickCheck { mtime: entry.mtime, meta: raw };
+        new_quickcheck.insert(entry.path.clone(), qc);
+        prev.remove(&entry.path);
+    }
+    stats.compressed_unique = resolved
+        .values()
+        .filter(|r| matches!(r, Resolved::Compressed(_)))
+        .count();
 
+    if partial {
+        // A file list updates only those files
+        for (path, pair) in std::mem::take(&mut prev) {
+            manifest.add_file(path, pair);
+        }
+        for (path, qc) in quickcheck {
+            new_quickcheck.entry(path).or_insert(qc);
+        }
+    } else {
+        for path in prev.keys() {
+            log::info!("File {path} was removed");
+        }
+    }
+
+    log::info!("Writing manifest to {}", manifest_path.display());
+    fsutil::atomic_write(&manifest_path, |w| manifest.write(w, LineEnding::Lf))
+        .context("Failed to write manifest")?;
+    fsutil::atomic_write(&quickcheck_path, |w| {
+        new_quickcheck.iter().try_for_each(|(p, qc)| qc.write(p, w))
+    })
+    .context("Failed to write quickcheck file")?;
+
+    log::info!("{:?}", stats);
     Ok(())
 }

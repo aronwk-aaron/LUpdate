@@ -16,6 +16,7 @@ assembly-pack = { path = "../Assembly/modules/pack", features = [
 ] }
 color-eyre = "0.5.11"
 env_logger = "0.9"
+flate2 = "1"
 globset = "0.4.8"
 rayon = "1.7"
 indexmap = { version = "1.8.0", features = ["serde-1"] }

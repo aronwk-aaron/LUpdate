@@ -28,6 +28,10 @@ pub struct GeneralConfig {
     /// relative to each project source dir
     #[serde(default = "res_dir")]
     pub res: String,
+    /// Names at the root of a project that don't belong in its manifest, such as
+    /// `.git` or `README.md`. Compared without regard to case.
+    #[serde(default)]
+    pub exclude_root: Vec<String>,
 }
 
 fn config_txt() -> PathBuf {
