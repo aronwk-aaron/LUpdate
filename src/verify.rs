@@ -60,6 +60,11 @@ fn pack_limit_notice(pack: &str, size: usize, entries: usize, warn_mb: usize) ->
     }
 }
 
+/// What to tell people about two paths sharing a CRC that were kept out of the pack index
+fn collision_notice(crc: u32, a: &str, b: &str, pki_name: &str) -> String {
+    format!("CRC collision: {a} and {b} share CRC {crc}; kept out of {pki_name}, they load loose")
+}
+
 /// The `(lower, upper)` links the client needs for `n` sorted entries. Lookups
 /// walk the links on disk from index `n >> 1`, so a wrong tree that stays in
 /// range makes files silently go missing.
@@ -402,6 +407,31 @@ mod tests {
     }
 
     #[test]
+    fn collision_notices() {
+        // The real pairs in the live caches
+        for (a, b) in [
+            (
+                "client/res/brickprimitives/lod2/57563.g",
+                "client/res/forkp/effects/celebration/celebrationsentinelsword/celebrationsentinelsword4.psb",
+            ),
+            (
+                "client/res/forkp/effects/racing/rgf_tiki_lap_fire/rgf_tiki_lap_fire3.psb",
+                "client/res/textures/ng_ninjago/ui/inventory/models/rew_ninjagomonastery_entranceleft.dds",
+            ),
+        ] {
+            let crc = calculate_crc(a.as_bytes()).to_raw();
+            assert_eq!(crc, calculate_crc(b.as_bytes()).to_raw(), "{a} {b}");
+            let notice = collision_notice(crc, a, b, "primary.pki");
+            assert_eq!(
+                notice,
+                format!("CRC collision: {a} and {b} share CRC {crc}; kept out of primary.pki, they load loose")
+            );
+        }
+        let crc = calculate_crc(b"client/res/brickprimitives/lod2/57563.g").to_raw();
+        assert_eq!(crc, 2708661638);
+    }
+
+    #[test]
     fn tree_checks() {
         let tree = search_tree(3);
         let good: Vec<_> = tree.iter().enumerate().map(|(i, t)| (i as u32, t.0, t.1)).collect();
@@ -546,6 +576,10 @@ fn audit(
             for (crc, a, b) in &colliding {
                 if pki.files.contains_key(&CRC::from_raw(*crc)) {
                     report.error("crc", format!("{a} and {b} have the same CRC {crc} and are in the pack index"));
+                } else {
+                    let notice = collision_notice(*crc, a, b, &pki_name);
+                    log::warn!("{notice}");
+                    report.notices.lock().unwrap().push(notice);
                 }
             }
             for (crc, file) in &pki.files {
